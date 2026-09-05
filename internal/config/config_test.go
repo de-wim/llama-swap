@@ -114,6 +114,39 @@ store:
 	})
 }
 
+func TestConfig_StoreCapturePersistence(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "db.sqlite")
+	caps := filepath.Join(dir, "caps")
+
+	cases := []struct {
+		name         string
+		yaml         string
+		captureDir   string
+		captureMaxMB int
+	}{
+		{"disabled by default", "store:\n  path: " + db, "", 0},
+		{"maxMB without dir stays disabled", "store:\n  path: " + db + "\n  captureMaxMB: 256", "", 256},
+		{"explicit dir preserved", "store:\n  path: " + db + "\n  captureMaxMB: 64\n  captureDir: " + caps, caps, 64},
+		{"dir set with unlimited max", "store:\n  path: " + db + "\n  captureDir: " + caps, caps, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(tc.yaml))
+			require.NoError(t, err)
+			require.NotNil(t, cfg.Store)
+			assert.Equal(t, tc.captureDir, cfg.Store.CaptureDir)
+			assert.Equal(t, tc.captureMaxMB, cfg.Store.CaptureMaxMB)
+		})
+	}
+
+	t.Run("negative max rejected", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader("store:\n  path: " + db + "\n  captureMaxMB: -1"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "store.captureMaxMB")
+	})
+}
+
 func TestConfig_FindConfig(t *testing.T) {
 
 	// TODO?

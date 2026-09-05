@@ -220,6 +220,10 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	}
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
+	diskCaptureMB, diskCaptureDir := 0, ""
+	if cfg.Store != nil {
+		diskCaptureMB, diskCaptureDir = cfg.Store.CaptureMaxMB, cfg.Store.CaptureDir
+	}
 	s := &Server{
 		cfg:           cfg,
 		muxlog:        muxlog,
@@ -227,7 +231,7 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		upstreamlog:   upstreamlog,
 		perf:          perfMon,
 		inflight:      newInflightTracker(),
-		metrics:       newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
+		metrics:       newMetricsMonitorWithDisk(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, diskCaptureMB, diskCaptureDir, st),
 		store:         st,
 		build:         build,
 		hardware:      hardware,
@@ -513,6 +517,10 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 	// released here leaks. The tool registry is cheap today and expensive once
 	// a provider holds upstream connections or subprocesses.
 	if err := s.tools.Shutdown(timeout); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := s.metrics.Close(); err != nil {
 		errs = append(errs, err)
 	}
 

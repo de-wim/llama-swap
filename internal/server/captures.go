@@ -1,13 +1,16 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/zstd"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
 )
 
 // ReqRespCapture is a stored request/response pair for a single metered request.
@@ -18,6 +21,101 @@ type ReqRespCapture struct {
 	ReqBody     []byte            `json:"req_body"`
 	RespHeaders map[string]string `json:"resp_headers"`
 	RespBody    []byte            `json:"resp_body"`
+}
+
+// captureStore persists compressed (zstd+CBOR) capture blobs keyed by activity
+// ID. The in-memory cache.Cache and the file-backed diskCapture both satisfy it.
+type captureStore interface {
+	Add(id int, data []byte) error
+	Get(id int) ([]byte, error)
+	Has(id int) bool
+}
+
+// combineCapture layers the given tiers, ignoring unconfigured (nil) ones. It
+// returns a single store when one tier is set, a tiered store when several are,
+// or nil when none is. Reads probe tiers in order (memory before disk); writes
+// go to every tier so a capture evicted from memory still survives on disk.
+func combineCapture(logger *logmon.Monitor, tiers ...captureStore) captureStore {
+	var active []captureStore
+	for _, tier := range tiers {
+		if tier != nil {
+			active = append(active, tier)
+		}
+	}
+	switch len(active) {
+	case 0:
+		return nil
+	case 1:
+		return active[0]
+	default:
+		return &tieredCapture{tiers: active, logger: logger}
+	}
+}
+
+// tieredCapture spans an ordered set of captureStore tiers.
+type tieredCapture struct {
+	tiers  []captureStore
+	logger *logmon.Monitor
+}
+
+// Add writes every tier and reports partial failures: a capture the first
+// tiers accept but a later one rejects would silently vanish once the working
+// tiers evict it, so the failure is warned about instead of hidden.
+func (t *tieredCapture) Add(id int, data []byte) error {
+	var lastErr error
+	stored := false
+	for _, tier := range t.tiers {
+		if err := tier.Add(id, data); err != nil {
+			lastErr = err
+		} else {
+			stored = true
+		}
+	}
+	if !stored {
+		return lastErr
+	}
+	if lastErr != nil && t.logger != nil {
+		t.logger.Warnf("capture %d stored in only some tiers: %v (may be lost after eviction or restart)", id, lastErr)
+	}
+	return nil
+}
+
+func (t *tieredCapture) Get(id int) ([]byte, error) {
+	var lastErr error
+	for _, tier := range t.tiers {
+		data, err := tier.Get(id)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errCaptureNotFound
+	}
+	return nil, lastErr
+}
+
+func (t *tieredCapture) Has(id int) bool {
+	for _, tier := range t.tiers {
+		if tier.Has(id) {
+			return true
+		}
+	}
+	return false
+}
+
+// Close releases each tier that is an io.Closer (the disk tier's reconcile
+// goroutine; the in-memory tier is not a Closer and is skipped).
+func (t *tieredCapture) Close() error {
+	var errs []error
+	for _, tier := range t.tiers {
+		if closer, ok := tier.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // captureFields is a bitmask controlling what a route stores in a ReqRespCapture.
